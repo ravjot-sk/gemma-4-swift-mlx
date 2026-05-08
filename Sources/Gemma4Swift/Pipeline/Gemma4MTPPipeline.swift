@@ -90,10 +90,25 @@ public actor Gemma4MTPPipeline {
         let seqVerify = sequentialVerify
 
         let stats = try await target.perform { context -> Stats in
-            guard let llm = context.model as? Gemma4LLMModel else {
+            // Adapter: supporte Gemma4LLMModel (text-only) ET Gemma4MultimodalLLMModel
+            // (image/video/audio via les pendingX deja set sur le model par le caller).
+            let langModel: Gemma4LanguageModel
+            let modelForward: (MLXArray, [any KVCache]) -> LanguageForwardOutput
+            if let textOnly = context.model as? Gemma4LLMModel {
+                langModel = textOnly.languageModel
+                modelForward = { inputs, c in
+                    textOnly.languageModel.forwardWithIntermediates(
+                        inputs: inputs, cache: c.map { $0 as KVCache? }
+                    )
+                }
+            } else if let multimodal = context.model as? Gemma4MultimodalLLMModel {
+                langModel = multimodal.languageModel
+                modelForward = { inputs, c in
+                    multimodal.forwardWithIntermediates(inputs, cache: c)
+                }
+            } else {
                 throw MTPError.unsupportedModel(String(describing: type(of: context.model)))
             }
-            let langModel = llm.languageModel
             let textCfg = langModel.config
 
             var s = Stats()
@@ -108,12 +123,9 @@ public actor Gemma4MTPPipeline {
             }
             let inputArr = MLXArray(promptIds.map { Int32($0) }).reshaped(1, -1)
 
-            // 2) Cache + prefill
+            // 2) Cache + prefill (multimodal: pendingX deja set sur le model par caller)
             let cache = langModel.makeCache()
-            let cacheArr = cache.map { $0 as KVCache? }
-            let prefillOut = langModel.forwardWithIntermediates(
-                inputs: inputArr, cache: cacheArr
-            )
+            let prefillOut = modelForward(inputArr, cache)
             eval(prefillOut.logits, prefillOut.preNormHiddenStates)
 
             let promptLen = inputArr.dim(1)
@@ -185,9 +197,7 @@ public actor Gemma4MTPPipeline {
                     var allPreNormHidden: [MLXArray] = []
                     for i in 0 ..< bs {
                         let single = verifyInput[0..., i..<(i+1)]
-                        let stepOut = langModel.forwardWithIntermediates(
-                            inputs: single, cache: cacheArr
-                        )
+                        let stepOut = modelForward(single, cache)
                         eval(stepOut.logits, stepOut.preNormHiddenStates)
                         allLogits.append(stepOut.logits)
                         allPreNormHidden.append(stepOut.preNormHiddenStates)
@@ -201,9 +211,7 @@ public actor Gemma4MTPPipeline {
                         intermediates: []  // unused
                     )
                 } else {
-                    verifyOut = langModel.forwardWithIntermediates(
-                        inputs: verifyInput, cache: cacheArr
-                    )
+                    verifyOut = modelForward(verifyInput, cache)
                     eval(verifyOut.logits, verifyOut.preNormHiddenStates)
                 }
 

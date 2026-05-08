@@ -262,6 +262,12 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .long, help: "Nombre maximum de tokens")
     var maxTokens: Int = 512
 
+    @Option(name: .customLong("draft-model"), help: "Repo HF d'un drafter Assistant pour speculative decoding (e.g. google/gemma-4-E2B-it-assistant). Active MTP, requiert temperature=0.")
+    var draftModel: String?
+
+    @Option(name: .long, help: "Block size MTP (drafter genere blockSize-1 tokens par round)")
+    var blockSize: Int = 4
+
     @Argument(help: "Le prompt utilisateur")
     var prompt: String
 
@@ -295,8 +301,38 @@ struct Generate: AsyncParsableCommand {
         print("Systeme: \(system)")
         print("Prompt: \(prompt)")
         print("Temperature: \(temperature), Max tokens: \(maxTokens)")
+        if let drafter = draftModel {
+            print("Drafter MTP: \(drafter), block_size=\(blockSize)")
+        }
         print("---")
 
+        let startGen = Date()
+        var tokenCount = 0
+
+        if let drafterRepo = draftModel {
+            // Path MTP: load drafter, run via Gemma4MTPPipeline
+            let drafter = try await loadDrafter(repo: drafterRepo, hfToken: hfToken)
+            let pipeline = Gemma4MTPPipeline(target: container, drafter: drafter)
+            let stream = await pipeline.mtpStream(
+                prompt: prompt, blockSize: blockSize, maxTokens: maxTokens
+            )
+            for try await piece in stream {
+                print(piece, terminator: "")
+                fflush(stdout)
+                tokenCount += 1
+            }
+            let genTime = Date().timeIntervalSince(startGen)
+            let stats = await pipeline.lastStats
+            let tokPerSec = genTime > 0 ? Double(stats.emittedTokens) / genTime : 0
+            print("\n\n--- Stats MTP ---")
+            print("Tokens emis: \(stats.emittedTokens)")
+            print("Rounds: \(stats.rounds), drafts acceptes: \(stats.acceptedDrafts)/\(stats.totalDrafts) (\(Int(stats.acceptRate * 100))%)")
+            print("Temps: \(String(format: "%.2f", genTime))s = \(String(format: "%.1f", tokPerSec)) tok/s")
+            print("GPU pic: \(MLX.GPU.peakMemory / (1024 * 1024)) Mo")
+            return
+        }
+
+        // Path standard (sans MTP)
         let params = GenerateParameters(
             maxTokens: maxTokens,
             temperature: temperature,
@@ -304,9 +340,6 @@ struct Generate: AsyncParsableCommand {
         )
 
         let session = ChatSession(container, instructions: system, generateParameters: params)
-
-        let startGen = Date()
-        var tokenCount = 0
 
         // Streaming token par token
         let stream = session.streamResponse(to: prompt)

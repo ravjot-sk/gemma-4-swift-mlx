@@ -73,11 +73,42 @@ public class Gemma4MultimodalLLMModel: Module, LLMModel, LoRAModel {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let cacheArray: [KVCache?]? = cache?.map { $0 as KVCache? }
+        let (inputsEmbeds, perLayerInputs) = prepareMultimodalEmbeds(inputs)
+        if let inputsEmbeds = inputsEmbeds {
+            return languageModel(
+                inputsEmbeds: inputsEmbeds,
+                cache: cacheArray,
+                perLayerInputs: perLayerInputs
+            )
+        }
+        return languageModel(inputs: inputs, cache: cacheArray)
+    }
 
-        // Si pas de media en attente, mode texte simple
+    /// Variante de `callAsFunction` qui retourne logits + hidden states (pre-norm) +
+    /// intermediates K/V — utilise par le path MTP speculative decoding.
+    public func forwardWithIntermediates(
+        _ inputs: MLXArray,
+        cache: [KVCache]?
+    ) -> LanguageForwardOutput {
+        let cacheArray: [KVCache?]? = cache?.map { $0 as KVCache? }
+        let (inputsEmbeds, perLayerInputs) = prepareMultimodalEmbeds(inputs)
+        if let inputsEmbeds = inputsEmbeds {
+            return languageModel.forwardWithIntermediates(
+                inputsEmbeds: inputsEmbeds,
+                cache: cacheArray,
+                perLayerInputs: perLayerInputs
+            )
+        }
+        return languageModel.forwardWithIntermediates(inputs: inputs, cache: cacheArray)
+    }
+
+    /// Construit les embeddings fusionnes (vision/video/audio) si du media est en attente.
+    /// Retourne (nil, nil) si pas de media — signal pour utiliser le path text-only.
+    /// Mute pendingX en nil apres consommation.
+    private func prepareMultimodalEmbeds(_ inputs: MLXArray) -> (MLXArray?, MLXArray?) {
         guard pendingPixelValues != nil || pendingVideoFrames != nil || pendingAudioFeatures != nil
               || pendingImageEmbeddings != nil || pendingAudioEmbeddings != nil else {
-            return languageModel(inputs: inputs, cache: cacheArray)
+            return (nil, nil)
         }
 
         // Mode multimodal: construire les embeddings fusionnes
@@ -193,11 +224,7 @@ public class Gemma4MultimodalLLMModel: Module, LLMModel, LoRAModel {
             pendingAudioMask = nil
         }
 
-        return languageModel(
-            inputsEmbeds: inputsEmbeds,
-            cache: cacheArray,
-            perLayerInputs: perLayerInputs
-        )
+        return (inputsEmbeds, perLayerInputs)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
