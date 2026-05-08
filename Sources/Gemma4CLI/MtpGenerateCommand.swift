@@ -26,6 +26,9 @@ struct MtpGenerate: AsyncParsableCommand {
     @Option(name: .long, help: "Repo HuggingFace du drafter Assistant")
     var drafter: String = "google/gemma-4-E2B-it-assistant"
 
+    @Option(name: .long, help: "Chemin vers un fichier safetensors de drafter fine-tune (override le drafter HF). Le config.json doit etre dans le meme repertoire ou hérité de --drafter.")
+    var drafterPath: String?
+
     @Option(name: .long, help: "Prompt utilisateur")
     var prompt: String = "Tell me a one-line fact about the moon."
 
@@ -43,6 +46,9 @@ struct MtpGenerate: AsyncParsableCommand {
 
     @Flag(name: .long, help: "DIAGNOSTIC: utiliser sequential verify (1 token a la fois, lent mais numeriquement equivalent au sequential decode)")
     var sequentialVerify: Bool = false
+
+    @Flag(name: .long, help: "Bypass le MaskedEmbedder a l'inference et utiliser le full lm head (necessaire si drafter est fine-tune sans toucher les centroides)")
+    var fullLmHead: Bool = false
 
     @Option(name: .long, help: "Token HuggingFace")
     var hfToken: String?
@@ -79,18 +85,38 @@ struct MtpGenerate: AsyncParsableCommand {
         let drafterCfgData = try Data(contentsOf: drafterDir.appendingPathComponent("config.json"))
         let drafterCfg = try JSONDecoder().decode(Gemma4AssistantConfig.self, from: drafterCfgData)
         let drafterModel = Gemma4AssistantDraftModel(drafterCfg)
-        let drafterSafetensors = try FileManager.default
-            .contentsOfDirectory(at: drafterDir, includingPropertiesForKeys: nil)
-            .filter { $0.pathExtension == "safetensors" }
+
+        // Choisir source des poids: override local (drafterPath) ou HF default (drafterDir)
+        let weightURLs: [URL]
+        if let pathStr = drafterPath {
+            let pathURL = URL(fileURLWithPath: pathStr)
+            // Si c'est un fichier .safetensors, juste celui-la. Sinon repertoire.
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: pathURL.path, isDirectory: &isDir)
+            if isDir.boolValue {
+                weightURLs = try FileManager.default
+                    .contentsOfDirectory(at: pathURL, includingPropertiesForKeys: nil)
+                    .filter { $0.pathExtension == "safetensors" }
+            } else {
+                weightURLs = [pathURL]
+            }
+            print("  drafter weights from local path: \(weightURLs.map { $0.lastPathComponent })")
+        } else {
+            weightURLs = try FileManager.default
+                .contentsOfDirectory(at: drafterDir, includingPropertiesForKeys: nil)
+                .filter { $0.pathExtension == "safetensors" }
+        }
+
         var rawWeights: [String: MLXArray] = [:]
-        for url in drafterSafetensors {
+        for url in weightURLs {
             for (k, v) in try MLX.loadArrays(url: url) { rawWeights[k] = v }
         }
         let sanitized = Gemma4AssistantWeightSanitizer.sanitize(
             weights: rawWeights, tieWordEmbeddings: drafterCfg.tieWordEmbeddings
         )
         try drafterModel.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
-        print("  loaded")
+        drafterModel.useFullLMHead = fullLmHead
+        print("  loaded\(fullLmHead ? " (full lm head)" : " (masked_embedding)")")
 
         // Generate via MTP pipeline
         print()

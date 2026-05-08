@@ -61,6 +61,11 @@ public class Gemma4AssistantDraftModel: Module {
     private var inputEmbed: Embedding?
     private var inputEmbedScale: Float = 1.0
 
+    /// Si true, l'inference bypass le MaskedEmbedder et utilise les embeddings tied
+    /// (= meme calcul que `trainForward`). Necessaire apres fine-tuning car les
+    /// centroides du MaskedEmbedder ne sont pas mis a jour pendant le training.
+    public var useFullLMHead: Bool = false
+
     // Etat lie au round courant via setSharedKV(...)
     public private(set) var sharedKV: SharedKVStates?
     public private(set) var kvOffset: Int = 0
@@ -182,7 +187,7 @@ public class Gemma4AssistantDraftModel: Module {
 
         // 5. LM head
         let logits: MLXArray
-        if let masked = maskedEmbedding {
+        if let masked = maskedEmbedding, !useFullLMHead {
             // Sparse softmax via MaskedEmbedder, utilise les embeddings du drafter
             logits = masked(h, lmHeadWeight: model.embedTokens.weight)
         } else if config.tieWordEmbeddings {
@@ -193,6 +198,67 @@ public class Gemma4AssistantDraftModel: Module {
             fatalError("Aucun LM head disponible (ni masked_embedding, ni tied, ni lm_head)")
         }
 
+        return (lastHidden, logits)
+    }
+
+    // MARK: - Training forward (multi-position parallel)
+
+    /// Forward parallel sur L positions pour le training (distillation contre le target).
+    ///
+    /// Differences vs `callAsFunction`:
+    /// - Accepte un `startPosition` (offset RoPE de la 1ere query) au lieu d'une seule
+    ///   position constante. Les L queries recoivent des rotations [startPosition,
+    ///   startPosition+1, ..., startPosition+L-1].
+    /// - Accepte un mask explicite (typiquement `.causal` pour le training).
+    ///
+    /// - Parameters:
+    ///   - inputsEmbeds: `[B, L, 2 * backbone_hidden]` — concat(target_embed(token), target_hidden) par position
+    ///   - sharedKVStates: K/V partages du target (typiquement la sequence complete)
+    ///   - startPosition: position globale du 1er token (offset RoPE)
+    ///   - mask: typiquement `.causal` pour le training (chaque position p attend aux positions ≤ p)
+    /// - Returns: `(lastHidden: [B, L, backbone_hidden], logits: [B, L, vocab_size])`
+    public func trainForward(
+        inputsEmbeds: MLXArray,
+        sharedKVStates: SharedKVStates,
+        startPosition: Int,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode = .causal
+    ) -> (lastHidden: MLXArray, logits: MLXArray) {
+        let textCfg = config.textConfig
+        var h = preProjection(inputsEmbeds)
+
+        let layerTypes = textCfg.resolvedLayerTypes
+        for (i, layer) in model.layers.enumerated() {
+            let layerType = layerTypes[i]
+            guard let kv = sharedKVStates[layerType] else {
+                fatalError("sharedKVStates manque pour layer_type=\(layerType)")
+            }
+            let (output, _, _) = layer(
+                h,
+                mask: mask,
+                cache: nil,
+                perLayerInput: nil,
+                sharedKV: kv,
+                sharedOffset: startPosition
+            )
+            h = output
+        }
+        h = model.norm(h)
+        let lastHidden = postProjection(h)
+
+        // IMPORTANT: pour le training on bypass le MaskedEmbedder (utilise putAlong/scatter
+        // que MLX refuse de differentier — "Cannot calculate VJP with respect to indices").
+        // Le MaskedEmbedder est une optimisation d'inference sparse; pour le training
+        // on calcule les logits denses via les embeddings tied (= meme matrice de poids
+        // que masked_embedding utilise via lm_head_weight).
+        let logits: MLXArray
+        if config.tieWordEmbeddings {
+            logits = model.embedTokens.asLinear(h)
+        } else if let head = lmHead {
+            logits = head(h)
+        } else {
+            // Fallback: utiliser embed_tokens meme si tieWordEmbeddings=false
+            logits = model.embedTokens.asLinear(h)
+        }
         return (lastHidden, logits)
     }
 
