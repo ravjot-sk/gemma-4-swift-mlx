@@ -6,6 +6,7 @@ import Gemma4Swift
 import MLX
 import MLXLMCommon
 import MLXLLM
+import MLXNN
 import Tokenizers
 
 // MARK: - Helpers
@@ -44,7 +45,7 @@ struct Gemma4CLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "gemma4-cli",
         abstract: "Inference Gemma 4 via MLX Swift",
-        subcommands: [Generate.self, Chat.self, Describe.self, Models.self, Download.self, Profile.self, LoRA.self],
+        subcommands: [Generate.self, Chat.self, Describe.self, Models.self, Download.self, Profile.self, LoRA.self, MtpSmoke.self, MtpForward.self, MtpGenerate.self, MtpDiagVerify.self, MtpTrain.self],
         defaultSubcommand: Generate.self
     )
 }
@@ -262,6 +263,12 @@ struct Generate: AsyncParsableCommand {
     @Option(name: .long, help: "Nombre maximum de tokens")
     var maxTokens: Int = 512
 
+    @Option(name: .customLong("draft-model"), help: "Repo HF d'un drafter Assistant pour speculative decoding (e.g. google/gemma-4-E2B-it-assistant). Active MTP, requiert temperature=0.")
+    var draftModel: String?
+
+    @Option(name: .long, help: "Block size MTP (drafter genere blockSize-1 tokens par round)")
+    var blockSize: Int = 4
+
     @Argument(help: "Le prompt utilisateur")
     var prompt: String
 
@@ -295,8 +302,38 @@ struct Generate: AsyncParsableCommand {
         print("Systeme: \(system)")
         print("Prompt: \(prompt)")
         print("Temperature: \(temperature), Max tokens: \(maxTokens)")
+        if let drafter = draftModel {
+            print("Drafter MTP: \(drafter), block_size=\(blockSize)")
+        }
         print("---")
 
+        let startGen = Date()
+        var tokenCount = 0
+
+        if let drafterRepo = draftModel {
+            // Path MTP: load drafter, run via Gemma4MTPPipeline
+            let drafter = try await loadDrafter(repo: drafterRepo, hfToken: hfToken)
+            let pipeline = Gemma4MTPPipeline(target: container, drafter: drafter)
+            let stream = await pipeline.mtpStream(
+                prompt: prompt, blockSize: blockSize, maxTokens: maxTokens
+            )
+            for try await piece in stream {
+                print(piece, terminator: "")
+                fflush(stdout)
+                tokenCount += 1
+            }
+            let genTime = Date().timeIntervalSince(startGen)
+            let stats = await pipeline.lastStats
+            let tokPerSec = genTime > 0 ? Double(stats.emittedTokens) / genTime : 0
+            print("\n\n--- Stats MTP ---")
+            print("Tokens emis: \(stats.emittedTokens)")
+            print("Rounds: \(stats.rounds), drafts acceptes: \(stats.acceptedDrafts)/\(stats.totalDrafts) (\(Int(stats.acceptRate * 100))%)")
+            print("Temps: \(String(format: "%.2f", genTime))s = \(String(format: "%.1f", tokPerSec)) tok/s")
+            print("GPU pic: \(MLX.GPU.peakMemory / (1024 * 1024)) Mo")
+            return
+        }
+
+        // Path standard (sans MTP)
         let params = GenerateParameters(
             maxTokens: maxTokens,
             temperature: temperature,
@@ -304,9 +341,6 @@ struct Generate: AsyncParsableCommand {
         )
 
         let session = ChatSession(container, instructions: system, generateParameters: params)
-
-        let startGen = Date()
-        var tokenCount = 0
 
         // Streaming token par token
         let stream = session.streamResponse(to: prompt)
@@ -352,6 +386,18 @@ struct Chat: AsyncParsableCommand {
     @Option(name: .long, help: "Max tokens par reponse")
     var maxTokens: Int = 1024
 
+    @Option(name: .customLong("draft-model"), help: "Repo HF d'un drafter Assistant pour speculative decoding (greedy uniquement)")
+    var draftModel: String?
+
+    @Option(name: .long, help: "Chemin local vers les poids du drafter (override --draft-model)")
+    var drafterPath: String?
+
+    @Option(name: .long, help: "Block size MTP")
+    var blockSize: Int = 4
+
+    @Flag(name: .long, help: "Bypass MaskedEmbedder a l'inference (drafter fine-tune)")
+    var fullLmHead: Bool = false
+
     func run() async throws {
         await Gemma4Registration.register()
         warnIfLowRAM(modelId: model)
@@ -364,6 +410,42 @@ struct Chat: AsyncParsableCommand {
         let container = try await loadLocalModel(path: path)
         print("Modele pret.")
 
+        // Path MTP: charge drafter, override les poids si fourni, configure pipeline
+        if let drafterRepo = draftModel {
+            print("Mode MTP active (greedy)")
+            let drafter = try await loadDrafter(repo: drafterRepo, hfToken: hfToken)
+            if let weightPath = drafterPath {
+                let url = URL(fileURLWithPath: weightPath)
+                var rawWeights: [String: MLXArray] = [:]
+                let urls: [URL]
+                var isDir: ObjCBool = false
+                FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+                if isDir.boolValue {
+                    urls = try FileManager.default
+                        .contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
+                        .filter { $0.pathExtension == "safetensors" }
+                } else {
+                    urls = [url]
+                }
+                for u in urls {
+                    for (k, v) in try MLX.loadArrays(url: u) { rawWeights[k] = v }
+                }
+                let sanitized = Gemma4AssistantWeightSanitizer.sanitize(
+                    weights: rawWeights, tieWordEmbeddings: true
+                )
+                try drafter.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
+                print("  drafter weights override: \(weightPath)")
+            }
+            drafter.useFullLMHead = fullLmHead
+            let pipeline = Gemma4MTPPipeline(target: container, drafter: drafter)
+            try await runMTPChatLoop(
+                pipeline: pipeline, container: container,
+                system: system, blockSize: blockSize, maxTokens: maxTokens
+            )
+            return
+        }
+
+        // Path standard (sans MTP)
         let params = GenerateParameters(
             maxTokens: maxTokens,
             temperature: temperature,
@@ -390,6 +472,51 @@ struct Chat: AsyncParsableCommand {
 
         print("Au revoir!")
     }
+}
+
+/// Chat loop multi-turn pour le path MTP. Maintient l'historique des messages,
+/// re-tokenise le contexte complet a chaque tour via le chat template.
+private func runMTPChatLoop(
+    pipeline: Gemma4MTPPipeline,
+    container: ModelContainer,
+    system: String,
+    blockSize: Int,
+    maxTokens: Int
+) async throws {
+    var history: [[String: String]] = [["role": "system", "content": system]]
+    print("\nChat Gemma 4 + MTP (tapez 'quit' pour quitter)\n")
+
+    while true {
+        print("Vous> ", terminator: "")
+        fflush(stdout)
+        guard let input = readLine(), !input.isEmpty else { continue }
+        if input.lowercased() == "quit" || input.lowercased() == "exit" { break }
+
+        history.append(["role": "user", "content": input])
+
+        // Tokeniser l'historique complet via le chat template
+        let messages = history
+        let tokenIds: [Int] = try await container.perform { context -> [Int] in
+            try context.tokenizer.applyChatTemplate(messages: messages)
+        }
+
+        print("Gemma> ", terminator: "")
+        var assistantResponse = ""
+        let stream = await pipeline.mtpStreamFromTokens(
+            tokenIds: tokenIds, blockSize: blockSize, maxTokens: maxTokens
+        )
+        for try await piece in stream {
+            print(piece, terminator: "")
+            fflush(stdout)
+            assistantResponse += piece
+        }
+        print("\n")
+
+        // Append la reponse a l'historique pour le tour suivant
+        history.append(["role": "assistant", "content": assistantResponse])
+    }
+
+    print("Au revoir!")
 }
 
 // MARK: - Describe (multimodal: image, audio, video)
