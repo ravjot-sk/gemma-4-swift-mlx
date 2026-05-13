@@ -288,7 +288,7 @@ public class Gemma4AssistantDraftModel: Module {
         }
         precondition(blockSize >= 2, "blockSize doit etre >= 2 (sinon aucun draft)")
 
-        var tok = MLXArray([Int32(lastBonus)]).reshaped(1, 1)  // [B=1, 1]
+        var tok = MLXArray([lastBonus]).reshaped(1, 1)  // [B=1, 1]
         var hPrev = hidden  // [B, 1, backbone]
         var tokens: [MLXArray] = []
 

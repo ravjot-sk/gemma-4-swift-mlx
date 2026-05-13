@@ -190,7 +190,7 @@ public actor Gemma4MTPPipeline {
 
             // 6) Boucle MTP
             while s.emittedTokens < maxTok {
-                // Sharedeading des K/V depuis le cache (etat valide jusqu'a cache.offset)
+                // Lecture des K/V partages depuis le cache (etat valide jusqu'a cache.offset)
                 let kvOffset = cache[lastFullCacheIdx].offset
                 let sharedKV = extractSharedKV(
                     cache: cache,
@@ -299,10 +299,6 @@ public actor Gemma4MTPPipeline {
             return s
         }
 
-        await MainActor.run { [stats] in
-            // Side-effect: mettre a jour les stats accessibles
-            // Note: lastStats est isolated par l'actor, donc setter via une methode async
-        }
         await self.setStats(stats)
     }
 
