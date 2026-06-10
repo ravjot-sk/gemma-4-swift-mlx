@@ -283,10 +283,13 @@ python3 /tmp/benchwork/fetch_mmlu_pro_cot.py  # produit /tmp/mmlu_pro_cot.json
 
 ### Résultats
 
-| Modèle | swift-mlx | mlx-vlm-py 0.6.2 | Δ Swift-Python | Référence Gemma 4 (CoT + chat template) | contributor |
-|---|---|---|---|---|---|
-| `12B-bf16` | 23.3% (7h08) | 19.5% (2h47) | +3.8 pts (dans le bruit) | 77.2% | @VincentGourbin |
-| `31B-4bit` | TBD | TBD | — | 85.2% | @VincentGourbin |
+| Modèle | swift-mlx | mlx-vlm-py 0.6.2 | Δ Swift-Python | Référence Gemma 4 (CoT + chat template) | contributor | commit |
+|---|---|---|---|---|---|---|
+| `12B-bf16` v1 (avant fix perf) | 23.3% (7h08) | 19.5% (2h47) | +3.8 pts (dans le bruit) | 77.2% | @VincentGourbin | 08b83b6 |
+| **`12B-bf16` v2 (après fast-path)** | **23.3% (3h06)** | 19.5% (2h47) | +3.8 pts (dans le bruit) | 77.2% | @VincentGourbin | 5403548 |
+| `31B-4bit` | TBD | TBD | — | 85.2% | @VincentGourbin | — |
+
+**Score identique avant/après fix** → déterminisme greedy validé.
 
 **Note sur l'écart aux chiffres officiels** (~55 pts) : le format raw text 5-shot
 CoT sous-utilise un modèle instruction-tuned. Pour matcher 77.2% officiel, il
@@ -295,10 +298,19 @@ faudrait :
 - System prompt potentiellement spécifique
 - Prompt engineering pour la structure CoT
 
-**Note sur la perf CoT** : sur Swift, l'eval CoT 12B prend ~2.5× plus de temps
-que Python (7h08 vs 2h47). Probable cause : recréation de cache à chaque
-question + prefill 1500+ tokens sans batching. Optimisation possible : réutiliser
-le préfixe 5-shot via shared KV prefix.
+**Note sur la perf CoT — évolution** :
+- v1 (commit 08b83b6) : Swift 7h08, Python 2h47 → Swift **2.5× plus lent**
+- v2 (commit 5403548) : Swift 3h06, Python 2h47 → Swift **1.11× plus lent** (gain 2.3×)
+
+Le fix v2 introduit un fast-path `forwardWithoutIntermediates` dans
+`Gemma4TextModel.callAsFunction` qui bypass la collecte d'intermediates K/V
+pour les modèles SANS KV-sharing (12B Unified, 31B). Avant le fix, on retenait
+~150 MB de K/V refs inutilisées pendant chaque forward, ce qui ajoutait une
+pression mémoire significative pendant le prefill long (1500+ tokens du 5-shot
+prompt).
+
+Pour E2B/E4B (avec KV-sharing), le path complet `forwardCollectingIntermediates`
+reste utilisé car nécessaire à l'algorithme de partage K/V entre couches.
 
 ---
 
@@ -367,6 +379,7 @@ Sources :
 | 2026-06-06 | 79341c2 | On-the-fly quantization (`--quantize-bits N`) | -3.5× RAM, +3× throughput vs bf16 |
 | 2026-06-06 | 5fde514 | Bump mlx-swift 0.31.3 → 0.31.4 | mxfp4 fonctionnel, +6% vitesse 12B 4-bit |
 | 2026-06-07 | e2c5a99 | Fix TurboQuant viability check pour MQA | TQ désactivé proprement sur 12B/E2B, évite -19% latence accidentelle |
+| 2026-06-10 | 5403548 | Fast-path callAsFunction sans intermediates (12B/31B) | MMLU Pro CoT 12B-bf16 7h08 → 3h06 (**2.3×**), throughput pur inchangé |
 
 ---
 
