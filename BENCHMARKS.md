@@ -283,12 +283,22 @@ python3 /tmp/benchwork/fetch_mmlu_pro_cot.py  # produit /tmp/mmlu_pro_cot.json
 
 ### Résultats
 
-| Modèle | swift-mlx | mlx-vlm-py 0.6.2 | Référence Gemma 4 (CoT + chat template) | contributor |
-|---|---|---|---|---|
-| `12B-bf16` | TBD | TBD | 77.2% | @VincentGourbin |
-| `31B-4bit` | TBD | TBD | 85.2% | @VincentGourbin |
+| Modèle | swift-mlx | mlx-vlm-py 0.6.2 | Δ Swift-Python | Référence Gemma 4 (CoT + chat template) | contributor |
+|---|---|---|---|---|---|
+| `12B-bf16` | 23.3% (7h08) | 19.5% (2h47) | +3.8 pts (dans le bruit) | 77.2% | @VincentGourbin |
+| `31B-4bit` | TBD | TBD | — | 85.2% | @VincentGourbin |
 
-Les chiffres Swift / Python sont en cours de collecte avec format raw text. L'écart aux chiffres officiels est attendu (chat template requise).
+**Note sur l'écart aux chiffres officiels** (~55 pts) : le format raw text 5-shot
+CoT sous-utilise un modèle instruction-tuned. Pour matcher 77.2% officiel, il
+faudrait :
+- Chat template Gemma 4 (`<bos><start_of_turn>user...<end_of_turn>`)
+- System prompt potentiellement spécifique
+- Prompt engineering pour la structure CoT
+
+**Note sur la perf CoT** : sur Swift, l'eval CoT 12B prend ~2.5× plus de temps
+que Python (7h08 vs 2h47). Probable cause : recréation de cache à chaque
+question + prefill 1500+ tokens sans batching. Optimisation possible : réutiliser
+le préfixe 5-shot via shared KV prefix.
 
 ---
 
