@@ -173,13 +173,111 @@ public class Gemma4TextModel: Module {
         perLayerInputs: MLXArray? = nil,
         visionTokenMask: MLXArray? = nil
     ) -> MLXArray {
-        forwardCollectingIntermediates(
+        // Fast path : modeles SANS KV-sharing (12B Unified, 31B). Bypass la
+        // collecte d'intermediates qui retient ~150 MB de K/V refs par forward
+        // et augmente la pression memoire pendant le prefill.
+        // Pour E2B/E4B (avec KV-sharing), on garde le path complet.
+        if firstKvSharedLayerIdx >= numHiddenLayers {
+            return forwardWithoutIntermediates(
+                inputs: inputs,
+                inputsEmbeds: inputsEmbeds,
+                cache: cache,
+                perLayerInputs: perLayerInputs,
+                visionTokenMask: visionTokenMask
+            )
+        }
+        return forwardCollectingIntermediates(
             inputs: inputs,
             inputsEmbeds: inputsEmbeds,
             cache: cache,
             perLayerInputs: perLayerInputs,
             visionTokenMask: visionTokenMask
         ).hidden
+    }
+
+    /// Forward optimise pour les modeles SANS KV-sharing.
+    /// Identique a forwardCollectingIntermediates() mais ne stocke pas les
+    /// K/V intermediaires (pas d'array `intermediates[]`, pas de
+    /// `publicIntermediates`, pas de struct TextForwardOutput a wrapper).
+    ///
+    /// Ne pas utiliser sur E2B/E4B (KV-sharing necessite les intermediates).
+    private func forwardWithoutIntermediates(
+        inputs: MLXArray? = nil,
+        inputsEmbeds: MLXArray? = nil,
+        cache: [KVCache?]? = nil,
+        perLayerInputs: MLXArray? = nil,
+        visionTokenMask: MLXArray? = nil
+    ) -> MLXArray {
+        var h: MLXArray
+        if let inputsEmbeds = inputsEmbeds {
+            h = inputsEmbeds
+        } else if let inputs = inputs {
+            h = embedTokens(inputs)
+            h = h * MLXArray(embedScale, dtype: h.dtype)
+        } else {
+            fatalError("inputs ou inputsEmbeds requis")
+        }
+
+        var finalPerLayerInputs: MLXArray? = nil
+        if hiddenSizePerLayerInput > 0 {
+            var pli = perLayerInputs
+            if inputs != nil && pli == nil {
+                pli = getPerLayerInputs(inputs!)
+            }
+            if pli != nil || inputs != nil {
+                finalPerLayerInputs = projectPerLayerInputs(h, perLayerInputs: pli)
+            }
+        }
+
+        let cacheArray = cache ?? Array(repeating: nil as KVCache?, count: firstKvSharedLayerIdx)
+
+        var globalMask = MLXLMCommon.createAttentionMask(
+            h: h,
+            cache: firstFullCacheIdx < cacheArray.count ? cacheArray[firstFullCacheIdx] : nil
+        )
+        var slidingWindowMask = MLXLMCommon.createAttentionMask(
+            h: h,
+            cache: firstSlidingCacheIdx < cacheArray.count ? cacheArray[firstSlidingCacheIdx] : nil,
+            windowSize: windowSize
+        )
+
+        let T = h.dim(1)
+        if let visionMask = visionTokenMask, T > 1 {
+            let blockIds = Gemma4BidirectionalMask.blockSequenceIds(visionMask: visionMask)
+            let overlay = Gemma4BidirectionalMask.overlay(blockSequenceIds: blockIds)
+            let causalGlobal = MLXLMCommon.createCausalMask(n: T, offset: 0)
+            let causalSliding = MLXLMCommon.createCausalMask(n: T, offset: 0, windowSize: windowSize)
+            let mergedGlobal = Gemma4BidirectionalMask.compose(causal: causalGlobal, overlay: overlay)
+            let mergedSliding = Gemma4BidirectionalMask.compose(causal: causalSliding, overlay: overlay)
+            globalMask = .array(mergedGlobal)
+            slidingWindowMask = .array(mergedSliding)
+        }
+
+        let layerTypes = config.resolvedLayerTypes
+
+        for (i, layer) in layers.enumerated() {
+            let cacheIdx = layerIdxToCacheIdx[i]
+            let c = cacheIdx < cacheArray.count ? cacheArray[cacheIdx] : nil
+            let isGlobal = layerTypes[i] == "full_attention"
+            let localMask = isGlobal ? globalMask : slidingWindowMask
+
+            let perLayerInput: MLXArray?
+            if let fpli = finalPerLayerInputs {
+                perLayerInput = fpli[0..., 0..., i, 0...]
+            } else {
+                perLayerInput = nil
+            }
+
+            // Pas de KV-sharing : on jette les K/V retournes par la couche
+            // (le cache les a deja stockes pour ses propres besoins).
+            let (output, _, _) = layer(
+                h, mask: localMask, cache: c, perLayerInput: perLayerInput,
+                sharedKV: nil, sharedOffset: nil
+            )
+            h = output
+        }
+
+        return norm(h)
     }
 
     /// Variante de `callAsFunction` qui retourne aussi les K/V intermediaires
