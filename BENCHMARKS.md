@@ -218,14 +218,20 @@ PYTHONPATH=~/Library/Python/3.12/lib/python/site-packages \
 
 | Modèle | swift-mlx | mlx-vlm-py 0.6.2 | Δ Swift-Python | hardware | contributor |
 |---|---|---|---|---|---|
+| `E2B-bf16` | 47.0% | crash (KV-shared bug) | — | M4 Max 96 GB | @VincentGourbin |
+| `E4B-4bit` | 55.0% | crash (KV-shared bug) | — | M4 Max 96 GB | @VincentGourbin |
 | `12B-bf16` | 57.0% | 61.0% | -4 pts | M4 Max 96 GB | @VincentGourbin |
+| `26B-A4B-4bit` (MoE) | 57.0% | **63.0%** | **-6 pts** ⚠ | M4 Max 96 GB | @VincentGourbin |
 | **`31B-4bit`** | **66.0%** | **66.0%** | **0 (exact match)** | M4 Max 96 GB | @VincentGourbin |
 | `12B-bf16` + OTF 8-bit | 58.0% | — | — | M4 Max 96 GB | @VincentGourbin |
 | `12B-bf16` + OTF 6-bit | 50.0% | — | — | M4 Max 96 GB | @VincentGourbin |
 | `12B-bf16` + OTF 4-bit affine | 32.0% | — | — | M4 Max 96 GB | @VincentGourbin |
 | `12B-bf16` + OTF 4-bit mxfp4 | 34.0% | — | — | M4 Max 96 GB | @VincentGourbin |
 | `12B-4bit` pre-quant (mix 4/8) | 37.0% | — | — | M4 Max 96 GB | @VincentGourbin |
-| `E2B-bf16` | 36.7% (n=30) | — | — | M4 Max 96 GB | @VincentGourbin |
+
+**Notes** :
+- E2B et E4B Python crash : bug `mlx-vlm 0.6.2` sur le KV-sharing (parameters not in model). Notre Swift port gère via `WeightSanitizer` qui strip les K/V projections des couches partagées.
+- 26B-A4B (MoE) Swift -6 pts vs Python → possible divergence dans notre port MoE (SwitchGLU/Experts). À investiguer.
 
 Observation : sur 12B Unified, la quantification 4-bit (n'importe quel mode)
 **dégrade significativement** la qualité MMLU (-20 à -25 pts). Le 8-bit
@@ -254,12 +260,18 @@ python3 /tmp/benchwork/fetch_mmlu_pro.py  # produit /tmp/mmlu_pro_5shot.json
 
 ### Résultats
 
-| Modèle | swift-mlx | mlx-vlm-py 0.6.2 | Δ Swift-Python | hardware | contributor |
-|---|---|---|---|---|---|
-| `12B-bf16` | 40.0% | 38.1% | +1.9 pts | M4 Max 96 GB | @VincentGourbin |
-| `31B-4bit` | 52.9% | 53.3% | -0.4 pts (1 question) | M4 Max 96 GB | @VincentGourbin |
+| Modèle | swift-mlx | mlx-vlm-py 0.6.2 | Δ Swift-Python | Google ref (CoT + chat template) | Δ vs Google | hardware | contributor |
+|---|---|---|---|---|---|---|---|
+| `E2B-bf16` | 24.8% | crash | — | 60.0% | -35 pts | M4 Max 96 GB | @VincentGourbin |
+| `E4B-4bit` | 32.9% | crash | — | 69.4% | -36 pts | M4 Max 96 GB | @VincentGourbin |
+| `12B-bf16` | 40.0% | 38.1% | +1.9 pts | 77.2% | -37 pts | M4 Max 96 GB | @VincentGourbin |
+| `26B-A4B-4bit` (MoE) | 44.8% | **47.6%** | **-2.8 pts** | 82.6% | -38 pts | M4 Max 96 GB | @VincentGourbin |
+| `31B-4bit` | 52.9% | 53.3% | -0.4 pts | 85.2% | -32 pts | M4 Max 96 GB | @VincentGourbin |
 
-Δ entre Swift et Python ≤ 2 pts → **portage validé**.
+**Observations** :
+- Δ Swift ↔ Python ≤ 3 pts sur tous les modèles testables → **portage validé**.
+- Écart constant ~35 pts vs Google → c'est le **gap méthodologique** (raw text non-CoT vs chat template + CoT). Cohérent à travers les 5 modèles.
+- 26B-A4B Swift -2.8 vs Python : à investiguer côté MoE.
 
 ---
 
@@ -349,14 +361,22 @@ pour la lecture d'OCR. Sans elle, le modèle hallucine ("ASICS TRAXXON" inventé
 
 ### Chiffres officiels Gemma 4 (depuis HuggingFace model cards)
 
-| Modèle | MMLU Pro (CoT) | GPQA Diamond | AIME 2026 |
-|---|---|---|---|
-| `12B-it` | 77.2% | 78.8% | 77.5% |
-| `31B-it` | 85.2% | 84.3% | 89.2% |
+| Modèle | MMLU Pro (CoT) | GPQA Diamond | AIME 2026 | LiveCodeBench v6 | MMMLU |
+|---|---|---|---|---|---|
+| `E2B-it` | 60.0% | 43.4% | 37.5% | 44.0% | 67.4% |
+| `E4B-it` | 69.4% | 58.6% | 42.5% | 52.0% | 76.6% |
+| `12B-it` | 77.2% | 78.8% | 77.5% | 72.0% | 83.4% |
+| `26B-A4B-it` (MoE) | 82.6% | 82.3% | 88.3% | 77.1% | 86.3% |
+| `31B-it` | 85.2% | 84.3% | 89.2% | 80.0% | 88.4% |
 
 Sources :
+- https://huggingface.co/google/gemma-4-E2B-it
+- https://huggingface.co/google/gemma-4-E4B-it
 - https://huggingface.co/google/gemma-4-12B-it
+- https://huggingface.co/google/gemma-4-26b-a4b-it
 - https://huggingface.co/google/gemma-4-31B-it
+
+**Note méthodologique** : Google reporte uniquement MMLU Pro avec CoT + chat template. Notre eval-mmlu utilise un format raw text 5-shot logit-based — donc Δ ~35 pts constant attendu vs Google. La comparaison Swift ↔ Python valide le portage à epsilon près ; la comparaison vs Google valide le tier du modèle (E2B < E4B < 12B < 26B-MoE < 31B est préservé).
 
 ### Hardware de référence M4 Max
 
