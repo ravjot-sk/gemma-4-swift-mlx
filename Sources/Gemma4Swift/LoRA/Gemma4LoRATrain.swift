@@ -143,7 +143,7 @@ public enum Gemma4LoRATrain {
         nonisolated(unsafe) let capturedTrainData = trainData
         nonisolated(unsafe) let capturedValidData = validData
 
-        try await container.perform { (context: ModelContext) in
+        try await container.perform { (context: ModelContext) -> Void in
             let model = context.model
             let tokenizer = context.tokenizer
 
@@ -243,9 +243,10 @@ public enum Gemma4LoRATrain {
                 }
             }
 
-            let avgResp = config.maskPrompt
-                ? trainSamples.map { $0.tokens.count - $0.promptOffset }.reduce(0, +) / max(1, trainSamples.count)
-                : trainSamples.map { $0.tokens.count }.reduce(0, +) / max(1, trainSamples.count)
+            let tokenCounts: [Int] = config.maskPrompt
+                ? trainSamples.map { $0.tokens.count - $0.promptOffset }
+                : trainSamples.map { $0.tokens.count }
+            let avgResp: Int = tokenCounts.reduce(0, +) / max(1, trainSamples.count)
             print("Train: \(trainSamples.count) samples (avg \(config.maskPrompt ? "response" : "total"): \(avgResp) tokens)")
 
             // Training loop custom (ref: mlx-lm train())
@@ -350,7 +351,7 @@ public enum Gemma4LoRATrain {
         nonisolated(unsafe) let capturedTrainData = trainData
         nonisolated(unsafe) let capturedValidData = validData
 
-        try await container.perform { (context: ModelContext) in
+        try await container.perform { (context: ModelContext) -> Void in
             let model = context.model
 
             // Convertir le modele en float32 pour eviter les NaN en bf16
