@@ -47,8 +47,8 @@ public enum Gemma4ModelDownloader {
             return modelDir
         }
 
-        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
-
+        // `runFileLoop` stages into `<modelDir>.partial` and promotes on success,
+        // so we don't pre-create `modelDir` (an empty dir would look downloaded).
         let specs = try await fetchHFFileSpecs(modelId: modelId, token: token)
         guard !specs.isEmpty else { throw Gemma4DownloadError.noFilesFound(modelId) }
 

@@ -98,6 +98,8 @@ public final class Gemma4DownloadManager {
         if FileManager.default.fileExists(atPath: dir.path) {
             try FileManager.default.removeItem(at: dir)
         }
+        // Also drop any leftover staging dir from an interrupted download.
+        try? FileManager.default.removeItem(at: stagingDirectory(for: dir))
         tasks.removeValue(forKey: modelId)
     }
 
@@ -122,7 +124,7 @@ public final class Gemma4DownloadManager {
             for part in modelId.split(separator: "/") {
                 modelDir = modelDir.appendingPathComponent(String(part))
             }
-            try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+            // `runFileLoop` stages and promotes atomically; don't pre-create modelDir.
 
             let specs = try await fetchHFFileSpecs(modelId: modelId, token: token)
             guard !specs.isEmpty else { throw Gemma4DownloadError.noFilesFound(modelId) }

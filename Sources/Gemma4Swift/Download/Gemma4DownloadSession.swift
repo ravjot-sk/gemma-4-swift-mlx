@@ -324,6 +324,14 @@ func fetchHFFileSpecs(modelId: String, token: String?) async throws -> [Download
 ///
 /// Shared by `Gemma4ModelDownloader` (one-shot) and `Gemma4DownloadManager` (observable).
 /// Already-present files are skipped unless `force` is true.
+/// The sibling staging directory a model is downloaded into before promotion,
+/// e.g. `.../models/org/model.partial`. Files accumulate here so an interrupted
+/// or cancelled download never leaves a half-populated model at the final path
+/// (where `isDownloaded` would accept a config.json + one shard as "complete").
+func stagingDirectory(for modelDir: URL) -> URL {
+    modelDir.appendingPathExtension("partial")
+}
+
 func runFileLoop(
     modelId: String,
     specs: [DownloadCoordinator.FileSpec],
@@ -333,10 +341,18 @@ func runFileLoop(
     token: String?,
     force: Bool = false
 ) async throws {
-    for (index, spec) in specs.enumerated() {
-        guard !(await coordinator.isCancelled) else { break }
+    // Download into a staging dir; promote to `modelDir` only once every file is
+    // present. Files already in staging are reused (resume), so retries don't
+    // re-fetch completed shards.
+    let staging = stagingDirectory(for: modelDir)
+    if force { try? FileManager.default.removeItem(at: staging) }
+    try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
 
-        let destination = modelDir.appendingPathComponent(spec.name)
+    for (index, spec) in specs.enumerated() {
+        // On cancel, leave staging in place for a later resume and do NOT promote.
+        guard !(await coordinator.isCancelled) else { return }
+
+        let destination = staging.appendingPathComponent(spec.name)
         if !force && FileManager.default.fileExists(atPath: destination.path) {
             await coordinator.skipFile(index: index)
             continue
@@ -360,4 +376,15 @@ func runFileLoop(
         }
         try FileManager.default.moveItem(at: tempURL, to: destination)
     }
+
+    // A cancel between the last file and here must not promote a partial model.
+    guard !(await coordinator.isCancelled) else { return }
+
+    // All files downloaded: atomically swap staging into the final location.
+    if FileManager.default.fileExists(atPath: modelDir.path) {
+        try FileManager.default.removeItem(at: modelDir)
+    }
+    try FileManager.default.createDirectory(
+        at: modelDir.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try FileManager.default.moveItem(at: staging, to: modelDir)
 }

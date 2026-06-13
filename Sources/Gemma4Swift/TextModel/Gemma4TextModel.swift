@@ -105,9 +105,14 @@ public class Gemma4TextModel: Module {
         // Embeddings
         self._embedTokens.wrappedValue = Embedding(embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
 
-        // Layers
+        // Layers. KV-shared layers (idx >= firstKvSharedLayerIdx) reuse an earlier
+        // layer's K/V and ship no k_proj/v_proj/k_norm/v_norm in the checkpoint, so
+        // they must be built with `kvSharedOnly` — otherwise weight loading fails on
+        // the first shared layer (e.g. `layers.15.self_attn.k_norm.weight not found`).
+        let firstShared = config.firstKvSharedLayerIdx
         self._layers.wrappedValue = (0 ..< config.numHiddenLayers).map { i in
-            Gemma4DecoderLayer(config, layerIdx: i)
+            let kvSharedOnly = firstShared > 0 && i >= firstShared
+            return Gemma4DecoderLayer(config, layerIdx: i, kvSharedOnly: kvSharedOnly)
         }
 
         self._norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
